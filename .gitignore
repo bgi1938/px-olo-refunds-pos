@@ -1,0 +1,19 @@
+# Credentials and tokens - NEVER commit these
+creds.json
+token.json
+
+# Logs
+*.log
+px-olo-refunds-pos.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+venv/
+env/
+.venv/
+
+# Render / deployment
+.render/
