@@ -4,23 +4,58 @@ import time
 import logging
 import base64
 from datetime import datetime
-
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-
 from bs4 import BeautifulSoup
 import re
+from flask import Flask, jsonify
 
 # ========================= CONFIG =========================
 # Use the same broad scope as your other project
-SCOPES = ['https://www.googleapis.com/auth/gmail.modify']   # ← Full access (matches your other project)
-
+SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
 POLL_INTERVAL = 60 # in seconds
 SUBJECT_KEYWORD = "Your Refund Has Been Submitted By"
 
+LOCS = {
+    "bg lab": "Menu",
+    "000010": "Webster",
+    "000020": "Henrietta",
+    "000040": "Penfield",
+    "000050": "Seabreeze (Culver Rd.)",
+    "000060": "Strong (Admission Required)",
+    "000070": "Chili (Chili Ave.)",
+    "000080": "Latta Rd.",
+    "000090": "Brockport",
+    "000100": "Avon",
+    "000120": "Irondequoit",
+    "000135": "Gates (Buffalo Rd.)",
+    "000170": "Ontario",
+    "000210": "North Greece Rd.",
+    "000220": "Port",
+    "000300": "Flaherty's",
+    "002000": "Bushnell's Basin",
+    "003000": "Canandaigua",
+    "006000": "Newark",
+    "006500": "Fairport",
+    "009500": "Brighton",
+    "010500": "Greece"
+}
+
+# ====================== FLASK APP ======================
+app = Flask(__name__)
+
+@app.route('/health')
+def health():
+    return jsonify({
+        "status": "running",
+        "message": "Refund monitor is active",
+        "timestamp": datetime.now(UTC).isoformat()
+    })
+
+# ====================== LOGGING ======================
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -34,47 +69,93 @@ logger = logging.getLogger(__name__)
 # ====================== GMAIL SERVICE ======================
 def get_gmail_service():
     logger.debug("Initializing Gmail service...")
+
+    # Use Render secret files path if available, otherwise fall back to local
+    secret_path = "/etc/secrets"
+    creds_path = os.path.join(secret_path, "creds.json")
+    token_path = os.path.join(secret_path, "token.json")
+
+    # Fallback for local development
+    #if not os.path.exists(creds_path):
+    #    creds_path = "creds.json"
+    #    token_path = "token.json"
+
     creds = None
-    
-    if os.path.exists('token.json'):
-        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
-    
+    if os.path.exists(token_path):
+        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             logger.info("Refreshing access token...")
             creds.refresh(Request())
         else:
-            logger.error("No valid token found. Please run the script locally first to generate token.json")
-            raise Exception("Missing or invalid token.json - Run locally to authorize")
-        
-        # Save updated token
-        with open('token.json', 'w') as token:
+            if not os.path.exists(creds_path):
+                logger.error("credentials.json not found! Please add it as a Secret File on Render.")
+                raise Exception("Missing credentials.json")
+            
+            logger.info("Starting OAuth2 flow (this should only run locally)...")
+            flow = InstalledAppFlow.from_client_secrets_file(creds_path, SCOPES)
+            creds = flow.run_local_server(port=0)
+
+        # Save updated token in Render at /etc/secrets
+        with open(token_path, 'w') as token:
             token.write(creds.to_json())
-    
+        logger.info("Token saved/updated.")
+
     service = build('gmail', 'v1', credentials=creds)
-    logger.info("Gmail service initialized successfully (using gmail.modify scope)")
+    logger.info("Gmail service initialized successfully.")
     return service
 
-# ====================== DATA EXTRACTOR ======================
-def extract_refund_data(html_content: str) -> dict:
-    logger.debug("Parsing HTML content...")
+# ====================== MAIN EXTRACTOR ========================================
+def extract_refund_data(html_content: str, subject: str) -> dict:
+    logger.info(f"Processing email: {subject}")
+    
     soup = BeautifulSoup(html_content, 'html.parser')
     
+    # ====================== LOCATION EXTRACTION ===============================
+    location = None
+    full_text = (subject + " " + html_content).lower()
+    
+    # Bill Gray's
+    if "bill gray" in full_text:
+        match = re.search(r"Bill Gray's?\s+([^\s<,]+(?:\s+[^\s<,]+)?)", subject + " " + html_content, re.I)
+        if match:
+            location = f"Bill Gray's {match.group(1).strip()}"
+    
+    # Tom Wahl's
+    elif "tom wahl" in full_text:
+        match = re.search(r"Tom Wahl's?\s+([^\s<,]+(?:\s+[^\s<,]+)?)", subject + " " + html_content, re.I)
+        if match:
+            location = f"Tom Wahl's {match.group(1).strip()}"
+    
+    # Flaherty's
+    elif "flaherty" in full_text:
+        location = "Flaherty's"
+    
+    # Fallback using your LOCS dictionary (location codes)
+    else:
+        for code, name in LOCS.items():
+            if code in full_text:
+                location = name
+                break
+    
+    # Final fallback from subject line
+    if not location:
+        match = re.search(r"By\s+(.+?)(?:\s+|$)", subject, re.I)
+        if match:
+            location = match.group(1).strip()
+
+    # ====================== BODY DATA EXTRACTION ======================
     data = {
         "order_number": None,
-        "location": None,
+        "location": location,
         "refund_amount": None,
         "requested_datetime": None,
         "submitted_datetime": None,
         "reason": None,
-        "customer_name": None,
-        "processed_at": datetime.utcnow().isoformat()
+        "processed_at": datetime.now(UTC).isoformat(),
+        "email_subject": subject
     }
-    
-    # Location
-    loc_match = re.search(r"Your Refund Has Been Submitted By (.+?)(?=\s|$|<)", html_content, re.I)
-    if loc_match:
-        data["location"] = loc_match.group(1).strip()
     
     # Order Number
     order_label = soup.find(string=re.compile(r'Order Number', re.I))
@@ -95,44 +176,60 @@ def extract_refund_data(html_content: str) -> dict:
         if next_td:
             data["requested_datetime"] = next_td.get_text(strip=True)
     
-    # Optional fields
+    # Submitted datetime
     sub_match = re.search(r'(\d{1,2}/\d{1,2}/\d{4} \d{1,2}:\d{2} [AP]M)', html_content)
     if sub_match:
         data["submitted_datetime"] = sub_match.group(1)
     
-    reason_match = re.search(r'(Missing|quality issue)', html_content, re.I)
-    if reason_match:
-        data["reason"] = reason_match.group(1).strip()
+    # Reason
+    reason = None
+    reason_cell = soup.find('td', attrs={'colspan': '2'})
+    if reason_cell:
+        reason_text = reason_cell.get_text(strip=True)
+        # Avoid picking up numeric lines or amounts
+        if reason_text and not reason_text.startswith('$') and not reason_text[0].isdigit():
+            reason = reason_text
     
-    logger.info(f"Successfully extracted data - Order #{data['order_number']} | Location: {data['location']} | Amount: {data['refund_amount']}")
+    # Fallback if colspan method fails
+    if not reason:
+        reason_match = soup.find(string=re.compile(r'(Missing|Wrong|issue)', re.I))
+        if reason_match:
+            reason = reason_match.strip()
+    
+    data["reason"] = reason
+
+    # Clean & Detailed Logging
+    logger.info("=" * 85)
+    logger.info("REFUND DATA EXTRACTED")
+    logger.info(f"Order Number       : {data['order_number'] or 'Not found'}")
+    logger.info(f"Location           : {data['location'] or 'Not found'}")
+    logger.info(f"Refund Amount      : {data['refund_amount'] or 'Not found'}")
+    logger.info(f"Requested DateTime : {data['requested_datetime'] or 'Not found'}")
+    logger.info(f"Submitted          : {data['submitted_datetime'] or 'Not found'}")
+    logger.info(f"Reason             : {data['reason'] or 'None'}")
+    logger.info("=" * 85)
+
     return data
 
-# ====================== MAIN LOOP ======================
-def main():
-    logger.info("=== Bill Gray's Refund Email Monitor Started ===")
-    logger.info(f"Monitoring for subject containing: '{SUBJECT_KEYWORD}'")
-    
-    service = get_gmail_service()
-    
+# ====================== BACKGROUND POLLING ======================
+def poll_emails(service):
+    logger.info("Starting email polling thread...")
     while True:
         try:
             query = f'is:unread subject:"{SUBJECT_KEYWORD}"'
             results = service.users().messages().list(userId='me', q=query, maxResults=10).execute()
             messages = results.get('messages', [])
             
-            logger.info(f"Found {len(messages)} new matching refund email(s)")
+            if messages:
+                logger.info(f"Found {len(messages)} new refund email(s)")
             
             for msg in messages:
                 msg_id = msg['id']
-                
                 msg_data = service.users().messages().get(userId='me', id=msg_id, format='full').execute()
                 
-                # Get subject for logging
                 headers = msg_data['payload'].get('headers', [])
                 subject = next((h['value'] for h in headers if h['name'] == 'Subject'), 'No Subject')
-                logger.info(f"Processing email: {subject}")
                 
-                # Extract HTML body
                 html_body = None
                 if 'parts' in msg_data['payload']:
                     for part in msg_data['payload']['parts']:
@@ -143,33 +240,35 @@ def main():
                     html_body = msg_data['payload'].get('body', {}).get('data')
                 
                 if not html_body:
-                    logger.warning("No HTML body found in email")
                     continue
                 
                 html_decoded = base64.urlsafe_b64decode(html_body).decode('utf-8', errors='ignore')
-                extracted = extract_refund_data(html_decoded)
+                extract_refund_data(html_decoded, subject)
                 
-                # === OUTPUT THE RESULT ===
-                print("\n" + "="*80)
-                print("REFUND EMAIL SUCCESSFULLY PROCESSED")
-                print(json.dumps(extracted, indent=2))
-                print("="*80 + "\n")
-                
-                # Mark as read
                 service.users().messages().modify(
-                    userId='me',
-                    id=msg_id,
-                    body={'removeLabelIds': ['UNREAD']}
+                    userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}
                 ).execute()
-                logger.info(f"Marked message {msg_id} as read")
                 
-        except HttpError as error:
-            logger.error(f"Gmail API error: {error}")
         except Exception as e:
-            logger.error(f"Unexpected error in main loop: {e}", exc_info=True)
+            logger.error(f"Error in polling loop: {e}", exc_info=True)
         
-        logger.debug(f"Sleeping for {POLL_INTERVAL} seconds...")
         time.sleep(POLL_INTERVAL)
+
+# ====================== MAIN ======================
+def main():
+    logger.info("=== Multi-Brand Refund Monitor Started ===")
+    
+    service = get_gmail_service()
+    
+    # Start polling in background thread
+    polling_thread = Thread(target=poll_emails, args=(service,), daemon=True)
+    polling_thread.start()
+    
+    logger.info(f"Polling thread started. Listening on port {os.environ.get('PORT', 10000)}")
+    
+    # Start Flask server (required by Render)
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
 
 if __name__ == "__main__":
     main()
