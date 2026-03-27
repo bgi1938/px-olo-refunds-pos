@@ -1,10 +1,15 @@
 import os
 import json
 import time
+import uuid
+import hashlib
+import secrets
 import logging
 import base64
+import requests
 from datetime import datetime, timezone
 from threading import Thread
+from urllib.parse import parse_qs, urlparse
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -17,7 +22,25 @@ from flask import Flask, jsonify
 # OPEN https://px-olo-refunds-pos.onrender.com/health TO KEEP ALIVE DURING TEST PHASE
 
 # ========================= CONFIG =========================
-# Use the same broad scope as your other project
+API_HOST = "https://mte2-sts.oraclecloud.com"
+AUTH_HOST = "https://ors-idm.mte2.oraclerestaurants.com"
+API_BASE = f"{API_HOST}/api/v1"
+AUTH_BASE = f"{AUTH_HOST}/oidc-provider/v1/oauth2"
+
+CLIENT_ID = os.environ.get("CLIENT_ID") #"QkdJLjgxMzBlYjZjLWE0NWYtNDhiMi1hNTEyLTI5MWI2ZjNlYjhiZg"
+USERNAME = os.environ.get("USERNAME") #"MITCH STSGen2"
+PASSWORD = os.environ.get("PASSWORD") #"B1llGr4y5!!!!"
+ORG_SHORT_NAME = "bgi"
+TOKEN_FILE = os.environ.get("TOKEN_FILE", "/opt/render/project/src/simphony_tokens.json")
+EMPLOYEE_REF = "1929"
+ORDER_TYPE_REF = 24
+MENU_ITEM_REF = 10103
+MENU_ITEM_NAME = "Open Food Incl Tax"
+RVC_REF = "1"
+
+USE_IDEMPOTENCY = True
+TOKEN_FILE = "C:\\Users\\mmcke4\\Desktop\\Projects\\TomWahls\\simphony_tokens.json"
+VERBOSE_BODY = True
 SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
 POLL_INTERVAL = 60 # in seconds
 SUBJECT_KEYWORD = "Your Refund Has Been Submitted By"
@@ -87,12 +110,12 @@ def get_gmail_service():
     if token_json:
         try:
             creds = Credentials.from_authorized_user_info(json.loads(token_json), SCOPES)
-            logger.info("Loaded token from environment variable")
+            logger.info("✅ Loaded token from environment variable")
         except Exception as e:
-            logger.error(f"Failed to parse GMAIL_TOKEN: {e}")
+            logger.error(f"❌ Failed to parse GMAIL_TOKEN: {e}")
 
     service = build('gmail', 'v1', credentials=creds)
-    logger.info("Gmail service initialized successfully.")
+    logger.info("✅ Gmail service initialized successfully.")
     return service
 
 # ====================== LOCATION NORMALIZATION ======================
@@ -112,7 +135,7 @@ def normalize_location(raw_location: str) -> str:
         if locref in cleaned_lower:   # fallback for codes
             return locref
 
-    logger.warning(f"Could not map location: '{raw_location}' → cleaned: '{cleaned}'")
+    logger.warning(f"⚠️ Could not map location: '{raw_location}' → cleaned: '{cleaned}'")
     return None
 
 # ====================== MAIN EXTRACTOR ========================================
@@ -236,9 +259,84 @@ def extract_refund_data(html_content: str, subject: str) -> dict:
     logger.info(f"Simphony Ref Text  : {data.get('simphony_reference') or 'Not built'}")
     logger.info("=" * 85)
 
-    #submit_to_simphony(data)
+    submit_to_simphony(data)
 
     return data
+
+# ====================== SIMPHONY STS GEN2 INTEGRATION ======================
+def submit_to_simphony(extracted: dict):
+    if not extracted.get("simphony_locref") or not extracted.get("refund_amount"):
+        logger.error("❌ Missing required data for Simphony submission.")
+        return False
+
+    reference_text = extracted.get("simphony_reference")
+    if not reference_text:
+        logger.error("❌ Could not build reference text.")
+        return False
+
+    logger.info(f"Submitting to Simphony → LocRef: {extracted['simphony_locref']} | Amount: {extracted['refund_amount']} | Ref: {reference_text}")
+
+    # ================== AUTH ==================
+    try:
+        id_token = get_valid_id_token()
+    except Exception as e:
+        logger.error(f"❌ Simphony authentication failed: {e}")
+        return False
+
+    # ================== CREATE CHECK ==================
+    idempotency = str(uuid.uuid4()).replace("-", "") if USE_IDEMPOTENCY else None
+
+    headers = {
+        "Authorization": f"Bearer {id_token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Simphony-OrgShortName": ORG_SHORT_NAME,
+        "Simphony-LocRef": extracted["simphony_locref"],
+        "Simphony-RvcRef": RVC_REF,
+    }
+
+    create_body = {
+        "header": {
+            "orgShortName": ORG_SHORT_NAME,
+            "locRef": extracted["simphony_locref"],
+            "rvcRef": int(RVC_REF),
+            "orderTypeRef": ORDER_TYPE_REF,
+            "checkEmployeeRef": EMPLOYEE_REF,
+            "idempotencyId": idempotency,
+            "status": "open",
+        },
+        "menuItems": [{
+            "menuItemId": MENU_ITEM_REF,
+            "name": MENU_ITEM_NAME,
+            "quantity": 1.0,
+            "unitPrice": float(extracted["refund_amount"]),
+            "total": float(extracted["refund_amount"]),
+            "referenceText": reference_text,
+            "extensions": [],
+        }],
+        "tenders": [{
+            "tenderId": 85,                    # Credit Card (you can make this configurable)
+            "name": "Credit Card",
+            "total": float(extracted["refund_amount"]),
+            "chargedTipTotal": 0.0,
+            "extensions": []
+        }]
+    }
+
+    try:
+        resp = requests.post(f"{API_BASE}/checks", headers=headers, json=create_body, timeout=30)
+        logger.info(f"Simphony create response: {resp.status_code}")
+
+        if resp.status_code in (200, 201):
+            logger.info("✅ Simphony check created and closed successfully!")
+            return True
+        else:
+            logger.error(f"❌ Simphony error: {resp.text}")
+            return False
+
+    except Exception as e:
+        logger.error(f"❌ Failed to call Simphony API: {e}")
+        return False
 
 # ====================== BACKGROUND POLLING ======================
 def poll_emails(service):
@@ -279,58 +377,216 @@ def poll_emails(service):
                 ).execute()
                 
         except Exception as e:
-            logger.error(f"Error in polling loop: {e}", exc_info=True)
+            logger.error(f"❌ Error in polling loop: {e}", exc_info=True)
         
         time.sleep(POLL_INTERVAL)
 
-# ====================== SIMPHONY STS GEN2 INTEGRATION ======================
-def submit_to_simphony(extracted: dict):
-    """Automatically create and close a check in Simphony using extracted data"""
+# ====================== SIMPHONY AUTH FUNCTIONS - PKCE ======================
+def generate_pkce_pair():
+    code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(64)).rstrip(b"=").decode()
+    code_challenge = base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode()).digest()).rstrip(b"=").decode()
+    return code_verifier, code_challenge
+
+def perform_full_authentication():
+    logger.info("Performing full PKCE authentication flow for Simphony...")
     
-    if not extracted.get("order_number") or not extracted.get("location"):
-        logger.error("Missing critical data (order_number or location). Skipping Simphony submission.")
+    session = requests.Session()
+    code_verifier, code_challenge = generate_pkce_pair()
+
+    authorize_url = f"{AUTH_BASE}/authorize"
+    params = {
+        "response_type": "code",
+        "client_id": CLIENT_ID,
+        "scope": "openid",
+        "redirect_uri": "apiaccount://callback",
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+    }
+
+    try:
+        resp = session.get(authorize_url, params=params, allow_redirects=False)
+        resp.raise_for_status()
+    except Exception as e:
+        logger.error(f"❌ Failed to get authorize URL: {e}")
+        raise
+
+    signin_url = f"{AUTH_BASE}/signin"
+    data = {
+        "username": USERNAME,
+        "password": PASSWORD,
+        "orgname": ORG_SHORT_NAME
+    }
+
+    resp = session.post(signin_url, data=data)
+    resp.raise_for_status()
+
+    result = resp.json()
+    if not result.get("success"):
+        raise Exception(f"❌ Simphony sign-in failed: {json.dumps(result, indent=2)}")
+
+    code = parse_qs(urlparse(result["redirectUrl"]).query)["code"][0]
+
+    token_url = f"{AUTH_BASE}/token"
+    token_data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "code_verifier": code_verifier,
+        "client_id": CLIENT_ID,
+        "scope": "openid",
+        "redirect_uri": "apiaccount://callback",
+    }
+
+    resp = session.post(token_url, data=token_data)
+    resp.raise_for_status()
+
+    tokens = resp.json()
+    tokens["expires_at"] = time.time() + int(tokens.get("expires_in", 1209600))
+
+    # Save token
+    try:
+        with open(TOKEN_FILE, "w") as f:
+            json.dump(tokens, f, indent=2)
+        logger.info("✅ Simphony authentication complete - Token saved to {TOKEN_FILE}")
+    except Exception as e:
+        logger.error(f"❌ Failed to save Simphony token file: {e}")
+
+    return tokens["id_token"]
+
+def refresh_saved_token():
+    try:
+        with open(TOKEN_FILE) as f:
+            tokens = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        logger.info("⚠️ No existing Simphony token file found.")
+        return None
+
+    refresh_token = tokens.get("refresh_token")
+    if not refresh_token:
+        return None
+
+    logger.info("Attempting to refresh Simphony token...")
+
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": CLIENT_ID,
+        "scope": "openid",
+        "redirect_uri": "apiaccount://callback",
+    }
+
+    resp = requests.post(f"{AUTH_BASE}/token", data=data)
+
+    if resp.status_code != 200:
+        logger.warning(f"⚠️ Simphony token refresh failed (status {resp.status_code}). Will do full auth next run.")
+        return None
+
+    new_tokens = resp.json()
+    new_tokens["expires_at"] = time.time() + int(new_tokens.get("expires_in", 1209600))
+
+    try:
+        with open(TOKEN_FILE, "w") as f:
+            json.dump(new_tokens, f, indent=2)
+        logger.info("✅ Simphony token refreshed successfully")
+    except Exception as e:
+        logger.error(f"❌ Failed to save refreshed Simphony token: {e}")
+
+    return new_tokens["id_token"]
+
+def get_valid_id_token():
+    token = refresh_saved_token()
+    if token:
+        return token
+
+    logger.info("❌ No valid Simphony token found - performing full authentication")
+    return perform_full_authentication()
+
+# ====================== SIMPHONY STS GEN2 - SUBMIT FUNCTION ======================
+def submit_to_simphony(extracted: dict):
+    """Automatically submit refund as an Open Amount Check to Simphony STS Gen2"""
+    
+    if not extracted.get("simphony_locref"):
+        logger.error("❌ Missing simphony_locref - cannot submit to Simphony")
+        return False
+    
+    if not extracted.get("refund_amount"):
+        logger.error("❌ Missing refund_amount - cannot submit to Simphony")
+        return False
+    
+    reference_text = extracted.get("simphony_reference")
+    if not reference_text:
+        logger.error("❌ Missing simphony_reference text")
         return False
 
-    # Build the exact reference text you want
-    order_num = extracted["order_number"]
-    
-    # Convert requested_datetime (e.g. "3/25/2026 06:45 PM") to MM/DD format
-    req_date = extracted.get("requested_datetime")
-    if req_date:
-        try:
-            # Handle formats like "3/25/2026 06:45 PM"
-            date_part = req_date.split()[0]  # "3/25/2026"
-            month, day, year = date_part.split('/')
-            short_date = f"{month.zfill(2)}/{day.zfill(2)}"
-        except:
-            short_date = "Unknown"
-    else:
-        short_date = "Unknown"
+    logger.info(f"Submitting to Simphony | LocRef: {extracted['simphony_locref']} | Amount: {extracted['refund_amount']} | Ref: {reference_text}")
 
-    reason = extracted.get("reason") or "No reason provided"
-    
-    reference_text = f"OO#{order_num} - {short_date} - {reason}"
-
-    logger.info(f"Prepared Simphony reference: {reference_text}")
-
-    # ================== CALL YOUR EXISTING SIMPHONY LOGIC ==================
     try:
-        # We'll create a non-GUI version of your check creation logic
-        # For now, log what would be submitted
-        logger.info("=" * 60)
-        logger.info("WOULD SUBMIT TO SIMPHONY:")
-        logger.info(f"Location       : {extracted['location']}")
-        logger.info(f"Amount         : {extracted['refund_amount']}")
-        logger.info(f"Reference Text : {reference_text}")
-        logger.info("=" * 60)
+        id_token = get_valid_id_token() # Get valid ID token (will refresh or do full auth if needed)
 
-        # TODO: Call your actual check creation function here
-        # submit_check_to_simphony(extracted['location'], extracted['refund_amount'], reference_text)
+        
+        idempotency = str(uuid.uuid4()).replace("-", "") if USE_IDEMPOTENCY else None
 
-        return True
+        headers = {
+            "Authorization": f"Bearer {id_token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Simphony-OrgShortName": ORG_SHORT_NAME,
+            "Simphony-LocRef": extracted["simphony_locref"],
+            "Simphony-RvcRef": RVC_REF,
+        }
+
+        create_body = {
+            "header": {
+                "orgShortName": ORG_SHORT_NAME,
+                "locRef": extracted["simphony_locref"],
+                "rvcRef": int(RVC_REF),
+                "orderTypeRef": ORDER_TYPE_REF,
+                "checkEmployeeRef": EMPLOYEE_REF,
+                "idempotencyId": idempotency,
+                "status": "open",
+            },
+            "menuItems": [{
+                "menuItemId": MENU_ITEM_REF,
+                "name": MENU_ITEM_NAME,
+                "quantity": 1.0,
+                "unitPrice": float(extracted["refund_amount"]),
+                "total": float(extracted["refund_amount"]),
+                "referenceText": reference_text,
+                "extensions": [],
+            }],
+            "tenders": [{
+                "tenderId": 85,                    # Credit Card - change if needed
+                "name": "Credit Card",
+                "total": float(extracted["refund_amount"]),
+                "chargedTipTotal": 0.0,
+                "extensions": []
+            }]
+        }
+
+        if VERBOSE_BODY:
+            logger.debug("Simphony Request Body:")
+            logger.debug(json.dumps(create_body, indent=2))
+
+        resp = requests.post(
+            f"{API_BASE}/checks", 
+            headers=headers, 
+            json=create_body, 
+            timeout=40
+        )
+
+        logger.info(f"Simphony API Response Status: {resp.status_code}")
+
+        if resp.status_code in (200, 201):
+            data = resp.json()
+            check_ref = data["header"].get("checkRef", "N/A")
+            check_num = data["header"].get("checkNumber", "N/A")
+            logger.info(f"✅ SUCCESS: Simphony Check #{check_num} created | CheckRef: {check_ref}")
+            return True
+        else:
+            logger.error(f"❌ Simphony API Error: {resp.status_code} - {resp.text}")
+            return False
 
     except Exception as e:
-        logger.error(f"Failed to submit to Simphony: {e}")
+        logger.error(f"❌ Failed to submit check to Simphony: {e}", exc_info=True)
         return False
 
 # ====================== MAIN ======================
