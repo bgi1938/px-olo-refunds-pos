@@ -268,6 +268,10 @@ def submit_to_simphony(extracted: dict):
     if not extracted.get("simphony_locref") or not extracted.get("refund_amount"):
         logger.error("❌ Missing required data for Simphony submission.")
         return False
+    
+    if not extracted.get("refund_amount"):
+        logger.error("❌ Missing refund_amount - cannot submit to Simphony")
+        return False
 
     reference_text = extracted.get("simphony_reference")
     if not reference_text:
@@ -315,7 +319,7 @@ def submit_to_simphony(extracted: dict):
             "extensions": [],
         }],
         "tenders": [{
-            "tenderId": 85,                    # Credit Card (you can make this configurable)
+            "tenderId": 85,                    # Always 'Credit Card' tender
             "name": "Credit Card",
             "total": float(extracted["refund_amount"]),
             "chargedTipTotal": 0.0,
