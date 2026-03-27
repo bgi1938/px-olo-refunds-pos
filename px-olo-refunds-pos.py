@@ -13,6 +13,8 @@ from bs4 import BeautifulSoup
 import re
 from flask import Flask, jsonify
 
+# OPEN https://px-olo-refunds-pos.onrender.com TO KEEP ALIVE DURING TEST PHASE
+
 # ========================= CONFIG =========================
 # Use the same broad scope as your other project
 SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
@@ -68,39 +70,18 @@ logger = logging.getLogger(__name__)
 
 # ====================== GMAIL SERVICE ======================
 def get_gmail_service():
-    logger.debug("Initializing Gmail service...")
-
-    # Use Render secret files path if available, otherwise fall back to local
-    secret_path = "/etc/secrets"
-    creds_path = os.path.join(secret_path, "creds.json")
-    token_path = os.path.join(secret_path, "token.json")
-
-    # Fallback for local development
-    #if not os.path.exists(creds_path):
-    #    creds_path = "creds.json"
-    #    token_path = "token.json"
-
+    logger.info("Initializing Gmail service...")
+    
     creds = None
-    if os.path.exists(token_path):
-        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            logger.info("Refreshing access token...")
-            creds.refresh(Request())
-        else:
-            if not os.path.exists(creds_path):
-                logger.error("credentials.json not found! Please add it as a Secret File on Render.")
-                raise Exception("Missing credentials.json")
-            
-            logger.info("Starting OAuth2 flow (this should only run locally)...")
-            flow = InstalledAppFlow.from_client_secrets_file(creds_path, SCOPES)
-            creds = flow.run_local_server(port=0)
-
-        # Save updated token in Render at /etc/secrets
-        with open(token_path, 'w') as token:
-            token.write(creds.to_json())
-        logger.info("Token saved/updated.")
+    
+    # Try to load token from Environment Variable (preferred)
+    token_json = os.environ.get("GMAIL_TOKEN")
+    if token_json:
+        try:
+            creds = Credentials.from_authorized_user_info(json.loads(token_json), SCOPES)
+            logger.info("Loaded token from environment variable")
+        except Exception as e:
+            logger.error(f"Failed to parse GMAIL_TOKEN: {e}")
 
     service = build('gmail', 'v1', credentials=creds)
     logger.info("Gmail service initialized successfully.")
