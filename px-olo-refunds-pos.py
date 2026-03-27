@@ -129,7 +129,7 @@ def extract_refund_data(html_content: str, subject: str) -> dict:
     if "bill gray" in full_text:
         match = re.search(r"Bill Gray's?\s+([^\s<,]+(?:\s+[^\s<,]+)?)", subject + " " + html_content, re.I)
         if match:
-            eaw_location = f"Bill Gray's {match.group(1).strip()}"
+            raw_location = f"Bill Gray's {match.group(1).strip()}"
     
     # Tom Wahl's
     elif "tom wahl" in full_text:
@@ -159,7 +159,7 @@ def extract_refund_data(html_content: str, subject: str) -> dict:
     # ====================== BODY DATA EXTRACTION ======================
     data = {
         "order_number": None,
-        "location": raw_location,
+        "raw_location": raw_location,
         "simphony_locref": simphony_locref,
         "refund_amount": None,
         "requested_datetime": None,
