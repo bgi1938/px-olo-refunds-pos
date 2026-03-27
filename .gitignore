@@ -1,6 +1,7 @@
 # Credentials and tokens - NEVER commit these
 creds.json
 token.json
+simphony_token.json
 
 # Logs
 *.log

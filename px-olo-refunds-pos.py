@@ -251,7 +251,7 @@ def extract_refund_data(html_content: str, subject: str) -> dict:
     logger.info("=" * 85)
     logger.info("REFUND DATA EXTRACTED")
     logger.info(f"Order Number       : {data['order_number'] or 'Not found'}")
-    logger.info(f"Raw Location       : {data['raw_location'] or 'Not found'}")
+    logger.info(f"Location           : {data['raw_location'] or 'Not found'}")
     logger.info(f"Simphony LocRef    : {data['simphony_locref'] or 'Not found'}")
     logger.info(f"Refund Amount      : {data['refund_amount'] or 'Not found'}")
     logger.info(f"Requested DateTime : {data['requested_datetime'] or 'Not found'}")
@@ -264,87 +264,82 @@ def extract_refund_data(html_content: str, subject: str) -> dict:
     return data
 
 # ====================== SIMPHONY STS GEN2 INTEGRATION ======================
-def submit_to_simphony(extracted: dict):
-    if not extracted.get("simphony_locref") or not extracted.get("refund_amount"):
-        logger.error("❌ Missing required data for Simphony submission.")
-        return False
+def submit_to_simphony(extracted: dict) -> bool:
+    """Returns True only if Simphony check was successfully created"""
     
-    if not extracted.get("refund_amount"):
-        logger.error("❌ Missing refund_amount - cannot submit to Simphony")
+    if not extracted.get("simphony_locref") or not extracted.get("refund_amount"):
+        logger.error("❌ Missing required data for Simphony submission")
         return False
 
     reference_text = extracted.get("simphony_reference")
     if not reference_text:
-        logger.error("❌ Could not build reference text.")
+        logger.error("❌ Missing simphony_reference")
         return False
 
-    logger.info(f"Submitting to Simphony → LocRef: {extracted['simphony_locref']} | Amount: {extracted['refund_amount']} | Ref: {reference_text}")
+    logger.info(f"Attempting Simphony submission | LocRef: {extracted['simphony_locref']} | Amount: {extracted['refund_amount']}")
 
-    # ================== AUTH ==================
     try:
         id_token = get_valid_id_token()
-    except Exception as e:
-        logger.error(f"❌ Simphony authentication failed: {e}")
-        return False
+        
+        idempotency = str(uuid.uuid4()).replace("-", "") if USE_IDEMPOTENCY else None
 
-    # ================== CREATE CHECK ==================
-    idempotency = str(uuid.uuid4()).replace("-", "") if USE_IDEMPOTENCY else None
+        headers = {
+            "Authorization": f"Bearer {id_token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Simphony-OrgShortName": ORG_SHORT_NAME,
+            "Simphony-LocRef": extracted["simphony_locref"],
+            "Simphony-RvcRef": RVC_REF,
+        }
 
-    headers = {
-        "Authorization": f"Bearer {id_token}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Simphony-OrgShortName": ORG_SHORT_NAME,
-        "Simphony-LocRef": extracted["simphony_locref"],
-        "Simphony-RvcRef": RVC_REF,
-    }
+        create_body = {
+            "header": {
+                "orgShortName": ORG_SHORT_NAME,
+                "locRef": extracted["simphony_locref"],
+                "rvcRef": int(RVC_REF),
+                "orderTypeRef": ORDER_TYPE_REF,
+                "checkEmployeeRef": EMPLOYEE_REF,
+                "idempotencyId": idempotency,
+                "status": "open",
+            },
+            "menuItems": [{
+                "menuItemId": MENU_ITEM_REF,
+                "name": MENU_ITEM_NAME,
+                "quantity": 1.0,
+                "unitPrice": float(extracted["refund_amount"]),
+                "total": float(extracted["refund_amount"]),
+                "referenceText": reference_text,
+                "extensions": [],
+            }],
+            "tenders": [{
+                "tenderId": 85,
+                "name": "Credit Card",
+                "total": float(extracted["refund_amount"]),
+                "chargedTipTotal": 0.0,
+                "extensions": []
+            }]
+        }
 
-    create_body = {
-        "header": {
-            "orgShortName": ORG_SHORT_NAME,
-            "locRef": extracted["simphony_locref"],
-            "rvcRef": int(RVC_REF),
-            "orderTypeRef": ORDER_TYPE_REF,
-            "checkEmployeeRef": EMPLOYEE_REF,
-            "idempotencyId": idempotency,
-            "status": "open",
-        },
-        "menuItems": [{
-            "menuItemId": MENU_ITEM_REF,
-            "name": MENU_ITEM_NAME,
-            "quantity": 1.0,
-            "unitPrice": float(extracted["refund_amount"]),
-            "total": float(extracted["refund_amount"]),
-            "referenceText": reference_text,
-            "extensions": [],
-        }],
-        "tenders": [{
-            "tenderId": 85,                    # Always 'Credit Card' tender
-            "name": "Credit Card",
-            "total": float(extracted["refund_amount"]),
-            "chargedTipTotal": 0.0,
-            "extensions": []
-        }]
-    }
-
-    try:
-        resp = requests.post(f"{API_BASE}/checks", headers=headers, json=create_body, timeout=30)
-        logger.info(f"Simphony create response: {resp.status_code}")
+        resp = requests.post(f"{API_BASE}/checks", headers=headers, json=create_body, timeout=40)
 
         if resp.status_code in (200, 201):
-            logger.info("✅ Simphony check created and closed successfully!")
+            data = resp.json()
+            check_ref = data["header"].get("checkRef", "N/A")
+            check_num = data["header"].get("checkNumber", "N/A")
+            logger.info(f"✅ Simphony Check #{check_num} created successfully | CheckRef: {check_ref}")
             return True
         else:
-            logger.error(f"❌ Simphony error: {resp.text}")
+            logger.error(f"❌ Simphony API returned error {resp.status_code}: {resp.text[:500]}")
             return False
 
     except Exception as e:
-        logger.error(f"❌ Failed to call Simphony API: {e}")
+        logger.error(f"❌ Exception during Simphony submission: {e}", exc_info=True)
         return False
 
-# ====================== BACKGROUND POLLING ======================
+# # ====================== BACKGROUND POLLING ====================== ❌✅⚠️
 def poll_emails(service):
     logger.info("Starting email polling thread...")
+    
     while True:
         try:
             query = f'is:unread subject:"{SUBJECT_KEYWORD}"'
@@ -356,32 +351,63 @@ def poll_emails(service):
             
             for msg in messages:
                 msg_id = msg['id']
-                msg_data = service.users().messages().get(userId='me', id=msg_id, format='full').execute()
                 
-                headers = msg_data['payload'].get('headers', [])
-                subject = next((h['value'] for h in headers if h['name'] == 'Subject'), 'No Subject')
+                success = False
                 
-                html_body = None
-                if 'parts' in msg_data['payload']:
-                    for part in msg_data['payload']['parts']:
-                        if part.get('mimeType') == 'text/html':
-                            html_body = part.get('body', {}).get('data')
-                            break
-                elif msg_data['payload'].get('mimeType') == 'text/html':
-                    html_body = msg_data['payload'].get('body', {}).get('data')
+                try:
+                    # Fetch full email
+                    msg_data = service.users().messages().get(
+                        userId='me', 
+                        id=msg_id, 
+                        format='full'
+                    ).execute()
+                    
+                    # Get subject for logging
+                    headers = msg_data['payload'].get('headers', [])
+                    subject = next((h['value'] for h in headers if h['name'] == 'Subject'), 'No Subject')
+                    
+                    # Extract HTML body
+                    html_body = None
+                    if 'parts' in msg_data['payload']:
+                        for part in msg_data['payload']['parts']:
+                            if part.get('mimeType') == 'text/html':
+                                html_body = part.get('body', {}).get('data')
+                                break
+                    elif msg_data['payload'].get('mimeType') == 'text/html':
+                        html_body = msg_data['payload'].get('body', {}).get('data')
+                    
+                    if not html_body:
+                        logger.warning(f"No HTML body in email {msg_id}")
+                        continue
+                    
+                    html_decoded = base64.urlsafe_b64decode(html_body).decode('utf-8', errors='ignore')
+                    
+                    # Extract data
+                    extracted = extract_refund_data(html_decoded, subject)
+                    
+                    # Submit to Simphony
+                    success = submit_to_simphony(extracted)
+                    
+                except Exception as e:
+                    logger.error(f"Error processing email {msg_id}: {e}", exc_info=True)
+                    success = False
                 
-                if not html_body:
-                    continue
-                
-                html_decoded = base64.urlsafe_b64decode(html_body).decode('utf-8', errors='ignore')
-                extract_refund_data(html_decoded, subject)
-                
-                service.users().messages().modify(
-                    userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}
-                ).execute()
+                # CRITICAL: Only mark as read if Simphony submission was successful
+                if success:
+                    try:
+                        service.users().messages().modify(
+                            userId='me',
+                            id=msg_id,
+                            body={'removeLabelIds': ['UNREAD']}
+                        ).execute()
+                        logger.info(f"✅ Email {msg_id} successfully processed and marked as read")
+                    except Exception as e:
+                        logger.error(f"Failed to mark email {msg_id} as read: {e}")
+                else:
+                    logger.warning(f"⚠️  Email {msg_id} was NOT marked as read (submission failed) — will retry on next poll")
                 
         except Exception as e:
-            logger.error(f"❌ Error in polling loop: {e}", exc_info=True)
+            logger.error(f"Error in main polling loop: {e}", exc_info=True)
         
         time.sleep(POLL_INTERVAL)
 
