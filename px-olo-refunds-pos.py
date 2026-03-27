@@ -3,7 +3,7 @@ import json
 import time
 import logging
 import base64
-from datetime import datetime
+from datetime import datetime, timezone
 from threading import Thread
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -14,7 +14,7 @@ from bs4 import BeautifulSoup
 import re
 from flask import Flask, jsonify
 
-# OPEN https://px-olo-refunds-pos.onrender.com TO KEEP ALIVE DURING TEST PHASE
+# OPEN https://px-olo-refunds-pos.onrender.com/health TO KEEP ALIVE DURING TEST PHASE
 
 # ========================= CONFIG =========================
 # Use the same broad scope as your other project
@@ -55,7 +55,15 @@ def health():
     return jsonify({
         "status": "running",
         "message": "Refund monitor is active",
-        "timestamp": datetime.now(UTC).isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    })
+
+@app.route('/')
+def home():
+    return jsonify({
+        "service": "Bill Gray's Refund Monitor",
+        "status": "running",
+        "endpoints": ["/health"]
     })
 
 # ====================== LOGGING ======================
@@ -135,7 +143,7 @@ def extract_refund_data(html_content: str, subject: str) -> dict:
         "requested_datetime": None,
         "submitted_datetime": None,
         "reason": None,
-        "processed_at": datetime.now(UTC).isoformat(),
+        "processed_at": datetime.now(timezone.utc).isoformat(),
         "email_subject": subject
     }
     
