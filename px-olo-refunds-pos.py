@@ -4,6 +4,7 @@ import time
 import logging
 import base64
 from datetime import datetime
+from threading import Thread
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -237,7 +238,7 @@ def poll_emails(service):
 
 # ====================== MAIN ======================
 def main():
-    logger.info("=== Multi-Brand Refund Monitor Started ===")
+    logger.info("====== Refund Monitor Started ======")
     
     service = get_gmail_service()
     
@@ -249,6 +250,7 @@ def main():
     
     # Start Flask server (required by Render)
     port = int(os.environ.get('PORT', 10000))
+    logger.info(f"Starting Flask server on port {port}")
     app.run(host='0.0.0.0', port=port)
 
 if __name__ == "__main__":
