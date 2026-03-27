@@ -61,7 +61,7 @@ def health():
 @app.route('/')
 def home():
     return jsonify({
-        "service": "Bill Gray's Refund Monitor",
+        "service": "BGI Refund Monitor",
         "status": "running",
         "endpoints": ["/health"]
     })
@@ -83,8 +83,7 @@ def get_gmail_service():
     
     creds = None
     
-    # Try to load token from Environment Variable (preferred)
-    token_json = os.environ.get("GMAIL_TOKEN")
+    token_json = os.environ.get("GMAIL_TOKEN") # env in Render
     if token_json:
         try:
             creds = Credentials.from_authorized_user_info(json.loads(token_json), SCOPES)
@@ -96,6 +95,26 @@ def get_gmail_service():
     logger.info("Gmail service initialized successfully.")
     return service
 
+# ====================== LOCATION NORMALIZATION ======================
+def normalize_location(raw_location: str) -> str:
+    """Return Simphony locref (e.g. '000010') from displayed location name"""
+    if not raw_location:
+        return None
+    
+    # Strip brand prefixes
+    cleaned = re.sub(r'^(Bill Gray\'s|Tom Wahl\'s|Flaherty\'s)\s*', '', raw_location.strip(), flags=re.I)
+    cleaned_lower = cleaned.lower().strip()
+
+    # Build reverse map: name → locref
+    for locref, name in LOCS.items():
+        if cleaned_lower == name.lower().strip() or cleaned_lower in name.lower():
+            return locref
+        if locref in cleaned_lower:   # fallback for codes
+            return locref
+
+    logger.warning(f"Could not map location: '{raw_location}' → cleaned: '{cleaned}'")
+    return None
+
 # ====================== MAIN EXTRACTOR ========================================
 def extract_refund_data(html_content: str, subject: str) -> dict:
     logger.info(f"Processing email: {subject}")
@@ -103,42 +122,45 @@ def extract_refund_data(html_content: str, subject: str) -> dict:
     soup = BeautifulSoup(html_content, 'html.parser')
     
     # ====================== LOCATION EXTRACTION ===============================
-    location = None
+    raw_location = None
     full_text = (subject + " " + html_content).lower()
     
     # Bill Gray's
     if "bill gray" in full_text:
         match = re.search(r"Bill Gray's?\s+([^\s<,]+(?:\s+[^\s<,]+)?)", subject + " " + html_content, re.I)
         if match:
-            location = f"Bill Gray's {match.group(1).strip()}"
+            eaw_location = f"Bill Gray's {match.group(1).strip()}"
     
     # Tom Wahl's
     elif "tom wahl" in full_text:
         match = re.search(r"Tom Wahl's?\s+([^\s<,]+(?:\s+[^\s<,]+)?)", subject + " " + html_content, re.I)
         if match:
-            location = f"Tom Wahl's {match.group(1).strip()}"
+            raw_location = f"Tom Wahl's {match.group(1).strip()}"
     
     # Flaherty's
     elif "flaherty" in full_text:
-        location = "Flaherty's"
+        raw_location = "Flaherty's"
     
     # Fallback using your LOCS dictionary (location codes)
     else:
         for code, name in LOCS.items():
             if code in full_text:
-                location = name
+                raw_location = name
                 break
     
     # Final fallback from subject line
-    if not location:
+    if not raw_location:
         match = re.search(r"By\s+(.+?)(?:\s+|$)", subject, re.I)
         if match:
-            location = match.group(1).strip()
+            raw_location = match.group(1).strip()
+
+    simphony_locref = normalize_location(raw_location)
 
     # ====================== BODY DATA EXTRACTION ======================
     data = {
         "order_number": None,
-        "location": location,
+        "location": raw_location,
+        "simphony_locref": simphony_locref,
         "refund_amount": None,
         "requested_datetime": None,
         "submitted_datetime": None,
@@ -188,16 +210,33 @@ def extract_refund_data(html_content: str, subject: str) -> dict:
     
     data["reason"] = reason
 
-    # Clean & Detailed Logging
+    # Build Simphony reference text
+    if data["order_number"] and data["requested_datetime"] and data["reason"]:
+        try:
+            date_part = data["requested_datetime"].split()[0]  # e.g. "3/25/2026"
+            month, day, _ = date_part.split('/')
+            short_date = f"{month.zfill(2)}/{day.zfill(2)}"
+            reference_text = f"OO#{data['order_number']} - {short_date} - {data['reason']}"
+            data["simphony_reference"] = reference_text
+            logger.info(f"Simphony Reference: {reference_text}")
+        except:
+            data["simphony_reference"] = None
+    else:
+        data["simphony_reference"] = None
+
+    # Final logging
     logger.info("=" * 85)
     logger.info("REFUND DATA EXTRACTED")
     logger.info(f"Order Number       : {data['order_number'] or 'Not found'}")
-    logger.info(f"Location           : {data['location'] or 'Not found'}")
+    logger.info(f"Raw Location       : {data['raw_location'] or 'Not found'}")
+    logger.info(f"Simphony LocRef    : {data['simphony_locref'] or 'Not found'}")
     logger.info(f"Refund Amount      : {data['refund_amount'] or 'Not found'}")
     logger.info(f"Requested DateTime : {data['requested_datetime'] or 'Not found'}")
-    logger.info(f"Submitted          : {data['submitted_datetime'] or 'Not found'}")
     logger.info(f"Reason             : {data['reason'] or 'None'}")
+    logger.info(f"Simphony Ref Text  : {data.get('simphony_reference') or 'Not built'}")
     logger.info("=" * 85)
+
+    #submit_to_simphony(data)
 
     return data
 
@@ -243,6 +282,56 @@ def poll_emails(service):
             logger.error(f"Error in polling loop: {e}", exc_info=True)
         
         time.sleep(POLL_INTERVAL)
+
+# ====================== SIMPHONY STS GEN2 INTEGRATION ======================
+def submit_to_simphony(extracted: dict):
+    """Automatically create and close a check in Simphony using extracted data"""
+    
+    if not extracted.get("order_number") or not extracted.get("location"):
+        logger.error("Missing critical data (order_number or location). Skipping Simphony submission.")
+        return False
+
+    # Build the exact reference text you want
+    order_num = extracted["order_number"]
+    
+    # Convert requested_datetime (e.g. "3/25/2026 06:45 PM") to MM/DD format
+    req_date = extracted.get("requested_datetime")
+    if req_date:
+        try:
+            # Handle formats like "3/25/2026 06:45 PM"
+            date_part = req_date.split()[0]  # "3/25/2026"
+            month, day, year = date_part.split('/')
+            short_date = f"{month.zfill(2)}/{day.zfill(2)}"
+        except:
+            short_date = "Unknown"
+    else:
+        short_date = "Unknown"
+
+    reason = extracted.get("reason") or "No reason provided"
+    
+    reference_text = f"OO#{order_num} - {short_date} - {reason}"
+
+    logger.info(f"Prepared Simphony reference: {reference_text}")
+
+    # ================== CALL YOUR EXISTING SIMPHONY LOGIC ==================
+    try:
+        # We'll create a non-GUI version of your check creation logic
+        # For now, log what would be submitted
+        logger.info("=" * 60)
+        logger.info("WOULD SUBMIT TO SIMPHONY:")
+        logger.info(f"Location       : {extracted['location']}")
+        logger.info(f"Amount         : {extracted['refund_amount']}")
+        logger.info(f"Reference Text : {reference_text}")
+        logger.info("=" * 60)
+
+        # TODO: Call your actual check creation function here
+        # submit_check_to_simphony(extracted['location'], extracted['refund_amount'], reference_text)
+
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to submit to Simphony: {e}")
+        return False
 
 # ====================== MAIN ======================
 def main():
